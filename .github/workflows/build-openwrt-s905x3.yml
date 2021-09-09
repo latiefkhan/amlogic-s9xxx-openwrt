@@ -1,0 +1,297 @@
+#========================================================================================================================
+# https://github.com/ophub/amlogic-s9xxx-openwrt
+# Description: Automatically Build OpenWrt for S9xxx-Boxs
+# Function: Workflows for Build S9xxx-Boxs
+# Cron: min (0 - 59) / hour (0 - 23) / day of month (1 - 31) / month (1 - 12) / day of week (0 - 6)(Sunday - Saturday)
+# Copyright (C) 2020 https://github.com/P3TERX/Actions-OpenWrt
+# Copyright (C) 2020 https://github.com/ophub/amlogic-s9xxx-openwrt
+#========================================================================================================================
+
+name: openwrt s905x3
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: 0 17 * * *
+#  watch:
+#    types: started
+
+env:
+  TOOLCHAIN_TAG: coolsnowwolf-lede-master
+  TOOLCHAIN_NAME: toolchain-image-coolsnowwolf-lede-master-bcm27xx-bcm2711.img
+  CONFIG_FILE: config/rpi4-lean-target.config
+  DIY_SH: scripts/lean-openwrt.sh
+  WEBROOT: /data/dnmp/www/openwrt.cc
+  UPLOAD_FIRMWARE: true
+  UPLOAD_BIN_DIR: true
+  UPLOAD_RELEASE: true
+  TZ: Asia/Jakarta
+
+jobs:
+  Build:
+    runs-on: ubuntu-18.04
+
+    outputs:
+      OPENWRTROOT: ${{ steps.prepare.outputs.OPENWRTROOT }}
+      PLATFORM: ${{ steps.compile.outputs.PLATFORM }}
+      TARGET: ${{ steps.compile.outputs.TARGET }}
+      SUBTARGET: ${{ steps.compile.outputs.SUBTARGET }}
+      FIRMWARE: ${{ steps.compile.outputs.FIRMWARE }}
+      GENERATE_STATUS: ${{ steps.generate.outputs.GENERATE_STATUS }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@main
+
+      - name: Initialization Environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo -E apt-get -qq update
+          sudo -E apt-get -qq install $(curl -fsSL git.io/depends-ubuntu-1804) rdate
+          sudo -E apt-get -qq autoremove --purge
+          sudo -E apt-get -qq clean
+          sudo ln -sf /usr/share/zoneinfo/Asia/Jakarta /etc/localtime
+          
+      - name: Prepare Toolchain Image
+        id: prepare
+        run: |
+          df -hT $PWD
+          sudo swapoff -a
+          sudo chown -R runner:runner /mnt
+          sudo rm -f /mnt/swapfile
+          wget -q https://github.com/helmiau/OpenWrt-Toolchain/releases/download/$TOOLCHAIN_TAG/$TOOLCHAIN_NAME -O /mnt/toolchain-image.img
+          mkdir /mnt/openwrt-ro openwrt workdir overlay
+          sudo mount -o loop /mnt/toolchain-image.img /mnt/openwrt-ro
+          sudo mount -t overlay overlay -o lowerdir=/mnt/openwrt-ro,upperdir=overlay,workdir=workdir openwrt
+          cd openwrt
+          echo "OPENWRTROOT=$PWD" >> $GITHUB_ENV
+          echo "::set-output name=OPENWRTROOT::$(echo $PWD)"
+          git pull
+
+    - name: Clone source code
+      working-directory: /workdir
+      run: |
+        df -hT $PWD
+        git clone --depth 1 $REPO_URL -b $REPO_BRANCH openwrt
+        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+
+    - name: Load custom feeds
+      run: |
+        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
+        chmod +x $DIY_P1_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P1_SH
+
+    - name: Update feeds
+      run: cd openwrt && ./scripts/feeds update -a
+
+    - name: Install feeds
+      run: cd openwrt && ./scripts/feeds install -a
+
+    - name: Load custom configuration
+      run: |
+        [ -e files ] && mv files openwrt/files
+        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        chmod +x $DIY_P2_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P2_SH
+
+    - name: Download package
+      id: package
+      run: |
+        cd openwrt
+        make defconfig
+        make download -j8
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: SSH connection to Actions @ Ctrl+C to enter, Ctrl+D to exit
+      uses: P3TERX/ssh2actions@main
+      if: (github.event.inputs.ssh == 'true' && github.event.inputs.ssh  != 'false') || contains(github.event.action, 'ssh')
+      env:
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+
+    - name: Compile the firmware
+      id: compile
+      run: |
+        cd openwrt
+        echo -e "$(nproc) thread compile"
+        make -j$(nproc) || make -j1 || make -j1 V=s
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        echo "FILE_DATE=$(date +"%Y.%m.%d.%H%M")" >> $GITHUB_ENV
+        echo "::set-output name=status::success"
+
+    - name: Check space usage
+      if: (!cancelled())
+      run: df -hT
+
+    - name: Upload OpenWrt bin directory to Actions
+      uses: actions/upload-artifact@v2
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
+      with:
+        name: openwrt_bin_armvirt_64_${{ env.FILE_DATE }}
+        path: openwrt/bin
+        retention-days: ${{ env.RECENT_LASTEST }}
+        if-no-files-found: ignore
+
+    - name: Organize armvirt files
+      id: organize
+      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      run: |
+        cd openwrt/bin/targets/*/*
+        rm -rf packages
+        echo "TMPFILEPATH=$PWD" >> $GITHUB_ENV
+        echo "::set-output name=status::success"
+
+    - name: Upload armvirt directory to Actions
+      uses: actions/upload-artifact@v2
+      if: steps.organize.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      with:
+        name: openwrt_armvirt_64_${{ env.FILE_DATE }}
+        path: ${{ env.TMPFILEPATH }}
+        retention-days: ${{ env.RECENT_LASTEST }}
+        if-no-files-found: ignore
+
+    - name: Build OpenWrt firmware
+      if: steps.organize.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      id: build
+      run: |
+        mkdir -p openwrt-armvirt
+        cp -f openwrt/bin/targets/*/*/*.tar.gz openwrt-armvirt/ && sync
+        sudo rm -rf openwrt && sync
+        sudo rm -rf /workdir && sync
+        sudo chmod +x make
+        sudo ./make -d -b s9xxx_n1_x96_hk1_h96_octopus_belink_belinkpro_ugoos -k 5.9.16_5.4.86
+        cd out/ && sudo gzip *.img
+        cp -f ../openwrt-armvirt/*.tar.gz . && sync
+        echo "FILEPATH=$PWD" >> $GITHUB_ENV
+        echo "::set-output name=status::success"
+
+    - name: Upload firmware directory for armvirt
+      uses: actions/upload-artifact@v2
+      if: steps.build.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      with:
+        name: openwrt-armvirt-64-default-rootfs_${{ env.FILE_DATE }}
+        path: ${{ env.FILEPATH }}/openwrt-armvirt-64-*
+        retention-days: ${{ env.RECENT_LASTEST }}
+        if-no-files-found: ignore
+
+    - name: Upload firmware directory for Phicomm-N1
+      uses: actions/upload-artifact@v2
+      if: steps.build.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      with:
+        name: openwrt_phicomm-n1_${{ env.FILE_DATE }}
+        path: ${{ env.FILEPATH }}/openwrt_n1_*
+        retention-days: ${{ env.RECENT_LASTEST }}
+        if-no-files-found: ignore
+
+    - name: Upload firmware directory for S9xxx-Boxs
+      uses: actions/upload-artifact@v2
+      if: steps.build.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      with:
+        name: openwrt_s9xxx_${{ env.FILE_DATE }}
+        path: ${{ env.FILEPATH }}/openwrt_s9xxx_*
+        retention-days: ${{ env.RECENT_LASTEST }}
+        if-no-files-found: ignore
+
+    - name: Upload firmware directory for Belink GT-King
+      uses: actions/upload-artifact@v2
+      if: steps.build.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      with:
+        name: openwrt_belink_${{ env.FILE_DATE }}
+        path: ${{ env.FILEPATH }}/openwrt_belink_*
+        retention-days: ${{ env.RECENT_LASTEST }}
+        if-no-files-found: ignore
+
+    - name: Upload firmware directory for Belink GT-King Pro
+      uses: actions/upload-artifact@v2
+      if: steps.build.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      with:
+        name: openwrt_belinkpro_${{ env.FILE_DATE }}
+        path: ${{ env.FILEPATH }}/openwrt_belinkpro_*
+        retention-days: ${{ env.RECENT_LASTEST }}
+        if-no-files-found: ignore
+
+    - name: Upload firmware directory for UGOOS AM6 Plus
+      uses: actions/upload-artifact@v2
+      if: steps.build.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      with:
+        name: openwrt_ugoos_${{ env.FILE_DATE }}
+        path: ${{ env.FILEPATH }}/openwrt_ugoos_*
+        retention-days: ${{ env.RECENT_LASTEST }}
+        if-no-files-found: ignore
+
+    - name: Upload firmware directory for X96-Max+
+      uses: actions/upload-artifact@v2
+      if: steps.build.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      with:
+        name: openwrt_x96-max_${{ env.FILE_DATE }}
+        path: ${{ env.FILEPATH }}/openwrt_x96_*
+        retention-days: ${{ env.RECENT_LASTEST }}
+        if-no-files-found: ignore
+
+    - name: Upload firmware directory for HK1-Box
+      uses: actions/upload-artifact@v2
+      if: steps.build.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      with:
+        name: openwrt_hk1-box_${{ env.FILE_DATE }}
+        path: ${{ env.FILEPATH }}/openwrt_hk1_*
+        retention-days: ${{ env.RECENT_LASTEST }}
+        if-no-files-found: ignore
+
+    - name: Upload firmware directory for H96-Max-X3
+      uses: actions/upload-artifact@v2
+      if: steps.build.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      with:
+        name: openwrt_h96-max-x3_${{ env.FILE_DATE }}
+        path: ${{ env.FILEPATH }}/openwrt_h96_*
+        retention-days: ${{ env.RECENT_LASTEST }}
+        if-no-files-found: ignore
+
+    - name: Upload firmware directory for Octopus-Planet
+      uses: actions/upload-artifact@v2
+      if: steps.build.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      with:
+        name: openwrt_octopus-planet_${{ env.FILE_DATE }}
+        path: ${{ env.FILEPATH }}/openwrt_octopus_*
+        retention-days: ${{ env.RECENT_LASTEST }}
+        if-no-files-found: ignore
+
+    - name: Upload OpenWrt Firmware to cowtransfer
+      if: steps.build.outputs.status == 'success' && env.UPLOAD_COWTRANSFER == 'true' && !cancelled()
+      run: |
+        curl -fsSL git.io/file-transfer | sh
+        ./transfer cow --block 2621440 -s -p 64 --no-progress ${{ env.FILEPATH }} 2>&1 | tee cowtransfer.log
+        echo "COW_URL=$(cat cowtransfer.log | grep https | cut -f3 -d" ")" >> $GITHUB_ENV
+
+    - name: Upload OpenWrt Firmware to WeTransfer
+      if: steps.build.outputs.status == 'success' && env.UPLOAD_WETRANSFER == 'true' && !cancelled()
+      run: |
+        curl -fsSL git.io/file-transfer | sh
+        ./transfer wet -s -p 16 --no-progress ${{ env.FILEPATH/openwrt_s9xxx_* }} 2>&1 | tee wetransfer.log
+        echo "WET_URL=$(cat wetransfer.log | grep https | cut -f3 -d" ")" >> $GITHUB_ENV
+
+    - name: Upload OpenWrt Firmware to Release
+      uses: softprops/action-gh-release@v1
+      if: steps.build.outputs.status == 'success' && env.UPLOAD_RELEASE == 'true' && !cancelled()
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: openwrt_s9xxx_${{ env.FILE_DATE }}
+        files: ${{ env.FILEPATH }}/*
+        body: |
+          This is OpenWrt firmware for S9xxx-Boxs
+          * Firmware information
+          Default IP: 192.168.1.1
+          Default username: root
+          Default password: password
+          Default WIFI name: OpenWrt
+          Default WIFI password: none
+          S9xxx-Boxs installation command: s9xxx-install.sh
+          Phicomm-N1 installation command: n1-install.sh
+          [WETRANSFER](${{ env.WET_URL }})
+        
